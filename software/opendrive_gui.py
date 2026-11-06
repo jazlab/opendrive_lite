@@ -12,17 +12,17 @@ License: MIT
 import csv
 import json
 import logging
+import threading
 import time
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Callable
 
+import serial
+import serial.tools.list_ports
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
-
-from control_protocol import Config, SerialProtocol
-from serial_manager import SerialManager
 
 # Configure logging
 logging.basicConfig(
@@ -33,6 +33,136 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
+# Configuration Constants
+# =============================================================================
+
+class Config:
+    """Global configuration parameters for the OpenDrive system."""
+
+    # Serial communication
+    BAUD_RATE: int = 115200
+    SERIAL_TIMEOUT: float = 0.1
+
+    # Motor limits
+    MAX_MOTORS: int = 6
+    MIN_ABSOLUTE_POS: float = 0.0      # mm
+    MAX_ABSOLUTE_POS: float = 50.0     # mm
+    MIN_SPEED: float = 0.001           # mm/s (inclusive)
+    MAX_SPEED: float = 0.2             # mm/s (inclusive)
+    MIN_TARGET_POS: float = 0.0        # mm
+    MAX_TARGET_POS: float = 50.0       # mm
+
+    # Timing intervals (seconds)
+    HEARTBEAT_INTERVAL: float = 0.5
+    HEARTBEAT_TIMEOUT: float = 1.0
+    POSITION_UPDATE_INTERVAL: float = 0.2
+    AUTO_SAVE_INTERVAL: float = 5.0
+    SERIAL_READ_INTERVAL: float = 0.02
+
+    # Data persistence
+    DATA_FILE: str = "opendrive_state.json"
+
+    # GUI Layout
+    WINDOW_TITLE: str = "OpenDrive Lite"
+    DECIMAL_PLACES: int = 3
+    ENTRY_WIDTH: int = 12
+    COLOR_BG: str = "#f0f0f0"
+    COLOR_FG: str = "#000000"
+    COLOR_ENTRY_BG: str = "#ffffff"
+    COLOR_READONLY_BG: str = "#d9d9d9"
+    COLOR_ACTIVE_BG: str = "#e5e5e5"
+    COLOR_SELECT_BG: str = "#4a90e2"
+
+    # Column Weights and Min Sizes for Grid Layout
+    # Col 0: Buttons/ID | Col 1: Speed | Col 2: Target | Col 3: Abs | Col 4: Rel | Col 5: Notes
+    COL_MIN_WIDTHS: tuple = (120, 100, 100, 100, 100, 150)
+    ROW_PAD_Y: int = 2
+    HEADER_PAD_Y: tuple = (5, 10)
+
+
+# =============================================================================
+# Serial Communication Protocol
+# =============================================================================
+
+class SerialProtocol:
+    """
+    Serial communication protocol between GUI and Teensy console.
+    
+    All commands use XOR checksum for data integrity verification.
+    Format: <command>,<arg1>,<arg2>,...*<checksum>
+    """
+
+    @staticmethod
+    def calculate_checksum(data: str) -> str:
+        """Calculate XOR checksum of data string and return as 2-digit hex."""
+        checksum = 0
+        for char in data:
+            checksum ^= ord(char)
+        return f"{checksum:02X}"
+
+    @staticmethod
+    def create_command(cmd: str, *args) -> str:
+        """Create a command string with checksum."""
+        if args:
+            data = f"{cmd},{','.join(str(a) for a in args)}"
+        else:
+            data = cmd
+        checksum = SerialProtocol.calculate_checksum(data)
+        return f"{data}*{checksum}\n"
+
+    @staticmethod
+    def parse_response(response: str) -> Optional[tuple]:
+        """
+        Parse a response string and verify checksum.
+        
+        Returns:
+            Tuple of (command, [args]) if valid, None if invalid.
+        """
+        response = response.strip()
+        if not response or '*' not in response:
+            return None
+
+        try:
+            data, received_checksum = response.rsplit('*', 1)
+            expected_checksum = SerialProtocol.calculate_checksum(data)
+
+            if received_checksum != expected_checksum:
+                return None
+
+            parts = data.split(',')
+            return (parts[0], parts[1:])
+        except (ValueError, IndexError):
+            return None
+
+    @staticmethod
+    def cmd_run(motor_id: int, speed: float, target: float, absolute: float) -> str:
+        """Create RUN command for motor movement."""
+        return SerialProtocol.create_command(
+            "RUN", motor_id, f"{speed:.6f}", f"{target:.3f}", f"{absolute:.3f}"
+        )
+
+    @staticmethod
+    def cmd_pause(motor_id: int) -> str:
+        """Create PAUSE command for a single motor."""
+        return SerialProtocol.create_command("PAUSE", motor_id)
+
+    @staticmethod
+    def cmd_pause_all() -> str:
+        """Create PAUSE_ALL command to stop all motors."""
+        return SerialProtocol.create_command("PAUSE_ALL")
+
+    @staticmethod
+    def cmd_heartbeat() -> str:
+        """Create HEARTBEAT command for connection monitoring."""
+        return SerialProtocol.create_command("HEARTBEAT")
+
+    @staticmethod
+    def cmd_update_target(motor_id: int, target: float) -> str:
+        """Create TARGET command to update motor target position."""
+        return SerialProtocol.create_command("TARGET", motor_id, f"{target:.3f}")
+
+
+# =============================================================================
 # Motor State Data Class
 # =============================================================================
 
@@ -40,7 +170,7 @@ logger = logging.getLogger(__name__)
 class MotorState:
     """
     State of a single motor/drive.
-
+    
     Attributes:
         motor_id: Unique identifier (1-indexed)
         speed: Movement speed in mm/s
@@ -73,17 +203,238 @@ class MotorState:
 
 
 # =============================================================================
+# Serial Manager
+# =============================================================================
+
+class SerialManager:
+    """
+    Manages serial communication with the Teensy console.
+    
+    Handles connection management, heartbeat monitoring, and position updates
+    in background threads.
+    """
+
+    def __init__(self, on_position_update: Callable, on_connection_lost: Callable):
+        """
+        Initialize SerialManager.
+        
+        Args:
+            on_position_update: Callback(motor_id, position) for position updates
+            on_connection_lost: Callback() when connection is lost
+        """
+        self._serial_port: Optional[serial.Serial] = None
+        self._port_name: str = ""
+        self._is_connected: bool = False
+
+        self._on_position_update = on_position_update
+        self._on_connection_lost = on_connection_lost
+
+        self._read_thread: Optional[threading.Thread] = None
+        self._heartbeat_thread: Optional[threading.Thread] = None
+        self._running: bool = False
+
+        self._last_heartbeat_received: float = 0.0
+        self._lock = threading.Lock()
+        self._connection_lost_notified: bool = False
+        self._heartbeat_suspended: bool = False
+
+    @property
+    def is_connected(self) -> bool:
+        """Return current connection status."""
+        return self._is_connected
+
+    @is_connected.setter
+    def is_connected(self, value: bool):
+        """Set connection status."""
+        self._is_connected = value
+
+    @property
+    def heartbeat_suspended(self) -> bool:
+        """Return whether heartbeat checking is suspended."""
+        return self._heartbeat_suspended
+
+    @heartbeat_suspended.setter
+    def heartbeat_suspended(self, value: bool):
+        """Set heartbeat suspension status."""
+        self._heartbeat_suspended = value
+
+    @property
+    def last_heartbeat_received(self) -> float:
+        """Return timestamp of last heartbeat."""
+        return self._last_heartbeat_received
+
+    @last_heartbeat_received.setter
+    def last_heartbeat_received(self, value: float):
+        """Set timestamp of last heartbeat."""
+        self._last_heartbeat_received = value
+
+    @staticmethod
+    def list_ports() -> list:
+        """Return list of available serial port names."""
+        ports = serial.tools.list_ports.comports()
+        return [port.device for port in ports]
+
+    def connect(self, port_name: str) -> bool:
+        """
+        Connect to the specified serial port.
+        
+        Args:
+            port_name: Name of the serial port to connect to.
+            
+        Returns:
+            True if connection successful, False otherwise.
+        """
+        try:
+            self.disconnect()
+
+            self._serial_port = serial.Serial(
+                port=port_name,
+                baudrate=Config.BAUD_RATE,
+                timeout=Config.SERIAL_TIMEOUT
+            )
+
+            self._serial_port.reset_input_buffer()
+            self._serial_port.reset_output_buffer()
+
+            self._port_name = port_name
+            self._is_connected = True
+            self._running = True
+            self._last_heartbeat_received = time.time()
+            self._connection_lost_notified = False
+
+            self._read_thread = threading.Thread(target=self._read_loop, daemon=True)
+            self._read_thread.start()
+
+            self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+            self._heartbeat_thread.start()
+
+            return True
+
+        except serial.SerialException as e:
+            logger.error("Connection error: %s", e)
+            self._is_connected = False
+            return False
+
+    def disconnect(self):
+        """Disconnect from the serial port and stop background threads."""
+        self._running = False
+        self._is_connected = False
+
+        if self._serial_port and self._serial_port.is_open:
+            try:
+                self._serial_port.close()
+            except serial.SerialException:
+                pass
+
+        self._serial_port = None
+        self._port_name = ""
+
+    def send(self, command: str) -> bool:
+        """
+        Send a command to the console.
+        
+        Args:
+            command: Command string to send.
+            
+        Returns:
+            True if send successful, False otherwise.
+        """
+        if not self._is_connected or not self._serial_port:
+            return False
+
+        try:
+            with self._lock:
+                self._serial_port.write(command.encode('utf-8'))
+                self._serial_port.flush()
+            return True
+        except serial.SerialException as e:
+            if self._running:
+                logger.error("Send error: %s", e)
+            return False
+
+    def _read_loop(self):
+        """Background thread loop for reading serial data."""
+        buffer = ""
+        while self._running:
+            try:
+                if (self._serial_port and 
+                    self._serial_port.is_open and 
+                    self._serial_port.in_waiting > 0):
+                    
+                    chunk = self._serial_port.read(
+                        self._serial_port.in_waiting
+                    ).decode('utf-8', errors='ignore')
+                    buffer += chunk
+
+                    while '\n' in buffer:
+                        line, buffer = buffer.split('\n', 1)
+                        line = line.strip()
+                        if line:
+                            self._handle_response(line)
+
+            except (OSError, serial.SerialException) as e:
+                if self._running:
+                    logger.error("Device disconnected: %s", e)
+                    self._running = False
+                    self._is_connected = False
+                    if not self._connection_lost_notified:
+                        self._connection_lost_notified = True
+                        self._on_connection_lost()
+                break
+
+            except Exception as e:
+                if self._running:
+                    logger.error("Read error: %s", e)
+
+            time.sleep(Config.SERIAL_READ_INTERVAL)
+
+    def _heartbeat_loop(self):
+        """Background thread loop for heartbeat monitoring."""
+        while self._running:
+            if not self._heartbeat_suspended:
+                self.send(SerialProtocol.cmd_heartbeat())
+
+                elapsed = time.time() - self._last_heartbeat_received
+                if elapsed > Config.HEARTBEAT_TIMEOUT:
+                    if self._is_connected and not self._connection_lost_notified:
+                        self._is_connected = False
+                        self._connection_lost_notified = True
+                        self._on_connection_lost()
+
+            time.sleep(Config.HEARTBEAT_INTERVAL)
+
+    def _handle_response(self, response: str):
+        """Process a response from the console."""
+        parsed = SerialProtocol.parse_response(response)
+        if not parsed:
+            return
+
+        cmd, args = parsed
+
+        if cmd == "HEARTBEAT_ACK":
+            self._last_heartbeat_received = time.time()
+
+        elif cmd == "POS" and len(args) >= 2:
+            try:
+                motor_id = int(args[0])
+                position = float(args[1])
+                self._on_position_update(motor_id, position)
+            except (ValueError, IndexError):
+                pass
+
+
+# =============================================================================
 # Notes Window
 # =============================================================================
 
 class NotesWindow(tk.Toplevel):
     """Popup window for editing motor notes."""
 
-    def __init__(self, parent: tk.Tk, motor_id: int, current_notes: str,
+    def __init__(self, parent: tk.Tk, motor_id: int, current_notes: str, 
                  on_save: Callable[[int, str], None]):
         """
         Initialize NotesWindow.
-
+        
         Args:
             parent: Parent Tk window
             motor_id: ID of motor being edited
@@ -131,8 +482,6 @@ class OpenDriveApp:
         self._root.title(Config.WINDOW_TITLE)
         self._configure_light_theme()
 
-        self._closing = False
-
         # State
         self._motor_states: list = []
         self._motor_widgets: list = []
@@ -141,8 +490,7 @@ class OpenDriveApp:
         # Serial manager
         self._serial_manager = SerialManager(
             on_position_update=self._on_position_update,
-            on_connection_lost=self._on_connection_lost,
-            on_connected=self._on_connected
+            on_connection_lost=self._on_connection_lost
         )
 
         # GUI variables (initialized in _build_ui)
@@ -171,7 +519,6 @@ class OpenDriveApp:
 
         # Start auto-save timer
         self._schedule_auto_save()
-        self._poll_serial_events()
 
         # Handle window close
         self._root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -350,12 +697,12 @@ class OpenDriveApp:
         # Col 0: Buttons (+/-)
         adjust_frame = tk.Frame(self._motors_container)
         adjust_frame.grid(row=0, column=0, sticky='w', padx=(0, 5), pady=Config.HEADER_PAD_Y)
-
+        
         tk.Button(
             adjust_frame, text="+", command=self._add_motor,
             font=('TkDefaultFont', 9), width=2
         ).pack(side=tk.LEFT, padx=1)
-
+        
         tk.Button(
             adjust_frame, text="-", command=self._remove_motor,
             font=('TkDefaultFont', 9), width=2
@@ -378,11 +725,11 @@ class OpenDriveApp:
     def _create_motor_row(self, state: MotorState, row_index: int) -> dict:
         """
         Create widgets for a motor row.
-
+        
         Args:
             state: MotorState for this row
             row_index: Grid row index (1-based, 0 is header)
-
+            
         Returns:
             Dictionary of widget references.
         """
@@ -496,17 +843,41 @@ class OpenDriveApp:
         return None
 
     def _safe_popup(self, popup_func: Callable, title: str, message: str = None, **kwargs):
-        """Queue a stop before a dialog; keep connection monitoring active."""
-        paused_any = any(state.is_running for state in self._motor_states)
-        if self._serial_manager.is_connected:
-            self._serial_manager.send(SerialProtocol.cmd_pause_all())
-        for state in self._motor_states:
-            state.is_running = False
-        if paused_any and message:
-            message += "\n\n(Safety: Running motors have been automatically paused)"
-        if message:
-            return popup_func(title, message, **kwargs)
-        return popup_func(title=title, **kwargs)
+        """
+        Show a popup dialog with automatic motor pause and heartbeat suspension.
+        
+        Suspends heartbeat checking and pauses all running motors before showing 
+        the dialog to prevent connection timeout during blocking dialogs.
+        """
+        paused_any = False
+
+        # Suspend heartbeat checking during the blocking dialog
+        self._serial_manager.heartbeat_suspended = True
+
+        try:
+            # Pause all running motors
+            if self._serial_manager.is_connected:
+                for state in self._motor_states:
+                    if state.is_running:
+                        self._serial_manager.send(SerialProtocol.cmd_pause(state.motor_id))
+                        state.is_running = False
+                        paused_any = True
+
+            # Add safety note to message if motors were paused
+            if paused_any and message:
+                message += "\n\n(Safety: Running motors have been automatically paused)"
+
+            # Show the popup
+            if message:
+                return popup_func(title, message, **kwargs)
+            else:
+                return popup_func(title=title, **kwargs)
+        
+        finally:
+            # Resume heartbeat checking and reset the timer
+            self._serial_manager.heartbeat_suspended = False
+            if self._serial_manager.is_connected:
+                self._serial_manager.last_heartbeat_received = time.time()
 
     # -------------------------------------------------------------------------
     # Event Handlers - Selection and Input
@@ -654,33 +1025,27 @@ class OpenDriveApp:
         ports = SerialManager.list_ports()
         self._port_combo['values'] = ports
 
-    def _poll_serial_events(self):
-        """Dispatch worker notifications only on Tk's thread."""
-        if self._closing:
-            return
-        self._serial_manager.poll_events()
-        self._root.after(20, self._poll_serial_events)
-
     def _on_connect(self):
-        """Request connection changes without waiting on a device."""
-        if self._serial_manager.is_connected:
-            self._serial_manager.disconnect()
-            for state in self._motor_states:
-                state.is_running = False
-            self._connect_btn.config(text="Connect")
-            return
-        if self._serial_manager.is_busy:
-            messagebox.showinfo("Connection Busy", "The previous connection is still opening or closing. Please wait.")
-            return
+        """Handle connect/disconnect button click."""
         port = self._port_var.get()
         if not port:
             messagebox.showwarning("No Port", "Please select a port.")
             return
-        if self._serial_manager.connect(port):
-            self._connect_btn.config(text="Connecting...")
 
-    def _on_connected(self):
-        self._connect_btn.config(text="Disconnect")
+        if self._serial_manager.is_connected:
+            # Pause all running motors before disconnecting
+            for state in self._motor_states:
+                if state.is_running:
+                    self._serial_manager.send(SerialProtocol.cmd_pause(state.motor_id))
+                    state.is_running = False
+            self._serial_manager.disconnect()
+            self._connect_btn.config(text="Connect")
+        else:
+            if self._serial_manager.connect(port):
+                self._connect_btn.config(text="Disconnect")
+                messagebox.showinfo("Connected", f"Connected to {port}")
+            else:
+                messagebox.showerror("Connection Failed", f"Could not connect to {port}")
 
     def _on_connection_lost(self):
         """Handle connection lost callback from serial manager."""
@@ -691,9 +1056,6 @@ class OpenDriveApp:
     def _show_connection_lost_dialog(self):
         """Show connection lost dialog on main thread."""
         self._connect_btn.config(text="Connect")
-        if self._serial_manager.failure_kind == "firmware":
-            messagebox.showwarning("Firmware Update Required", self._serial_manager.failure_reason)
-            return
         messagebox.showwarning(
             "Connection Lost",
             "Connection to console was lost. Any running motors have been paused. "
@@ -815,7 +1177,8 @@ class OpenDriveApp:
             cmd = SerialProtocol.cmd_run(
                 state.motor_id, state.speed, state.target, state.absolute
             )
-            state.is_running = self._serial_manager.send(cmd)
+            self._serial_manager.send(cmd)
+            state.is_running = True
 
     def _on_pause(self):
         """Handle Pause button click."""
@@ -844,6 +1207,9 @@ class OpenDriveApp:
                 if state.is_running:
                     self._serial_manager.send(SerialProtocol.cmd_pause(state.motor_id))
                     state.is_running = False
+
+        # Suspend heartbeat checking during the blocking file dialog
+        self._serial_manager.heartbeat_suspended = True
 
         try:
             filepath = filedialog.asksaveasfilename(
@@ -880,6 +1246,12 @@ class OpenDriveApp:
 
         except IOError as e:
             messagebox.showerror("Export Error", f"Failed to export: {e}")
+
+        finally:
+            # Resume heartbeat checking and reset the timer
+            self._serial_manager.heartbeat_suspended = False
+            if self._serial_manager.is_connected:
+                self._serial_manager.last_heartbeat_received = time.time()
 
     def _on_clear(self):
         """Clear selected motors - pause if running, then wipe values."""
@@ -924,7 +1296,7 @@ class OpenDriveApp:
             state.absolute = absolute
             state.relative = absolute - state.relative_zero_point
 
-        self._update_position_display(motor_id, absolute)
+        self._root.after(0, lambda: self._update_position_display(motor_id, absolute))
 
     def _update_position_display(self, motor_id: int, absolute: float):
         """Update position display widgets on main thread."""
@@ -984,28 +1356,19 @@ class OpenDriveApp:
     # -------------------------------------------------------------------------
 
     def _on_close(self):
-        """Stop asynchronously, allowing a bounded time for the final stop."""
-        if self._closing:
-            return
-        self._closing = True
-        self._serial_manager.disconnect()
-        for state in self._motor_states:
-            state.is_running = False
-        self._save_state()
-        self._shutdown_deadline = time.monotonic() + Config.SERIAL_SHUTDOWN_TIMEOUT
-        self._finish_close()
+        """Handle window close event."""
+        if self._serial_manager.is_connected:
+            self._serial_manager.send(SerialProtocol.cmd_pause_all())
 
-    def _finish_close(self):
-        if self._serial_manager.is_busy and time.monotonic() < self._shutdown_deadline:
-            self._root.after(20, self._finish_close)
-            return
+        self._serial_manager.disconnect()
+        self._save_state()
+
         for window in self._notes_windows.values():
             try:
                 window.destroy()
             except tk.TclError:
                 pass
-        for timer_id in self._root.tk.call('after', 'info'):
-            self._root.after_cancel(timer_id)
+
         self._root.destroy()
 
 
