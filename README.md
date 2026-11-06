@@ -45,8 +45,6 @@ The firmware targets the documented OpenDrive console wiring and motor mechanics
 5. Select a motor's checkbox, enter **Speed** in mm/s and **Target** in absolute mm, then click **Run**. The default limits are 0–50 mm and 0.001–0.2 mm/s. Confirm the intended direction and travel with a short bench movement first.
 6. **Pause** stops selected running motors. **Zero** sets selected motors' relative-position reference; it does not move the drive or change the absolute position. **Export** pauses movement and saves the current table to CSV. Notes and state are also saved automatically.
 
-Read the [OpenDrive documentation](https://docs.google.com/document/d/1CwdIq8lv9Gtcey1GMihnH131U_tzeRZlZ0cmyOJbvFY/edit), especially the Console Manual and safety instructions, for other system details. Do not connect/disconnect drives while powered, let a drive hit a travel stop, or leave a running system unattended. Disconnect console power to stop movement in an emergency. Test the complete system on the bench before experimental use.
-
 ## Contact
 
 For questions, contact [opendrive@mit.edu](mailto:opendrive@mit.edu).
