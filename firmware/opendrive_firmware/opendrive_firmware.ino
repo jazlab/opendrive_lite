@@ -1,8 +1,8 @@
 /**
  * OpenDrive Console Firmware
- *
+ * 
  * Teensy 4.0 firmware for controlling up to 6 stepper motor microdrives.
- *
+ * 
  * Author: OpenDrive Project
  * License: MIT
  */
@@ -14,37 +14,34 @@
 // =============================================================================
 
 namespace Config {
-    // Match the GUI compatibility constants; bump when this contract changes.
-    constexpr const char* FIRMWARE_PRODUCT = "OpenDrive";
-    constexpr const char* FIRMWARE_VARIANT = "lite";
-    constexpr const char* FIRMWARE_VERSION = "1.0.0";
     constexpr unsigned long SERIAL_BAUD = 115200;
     constexpr size_t SERIAL_BUFFER_SIZE = 128;
-
+    
     constexpr unsigned long POSITION_UPDATE_INTERVAL_MS = 200;
     constexpr unsigned long HEARTBEAT_TIMEOUT_MS = 1000;
-
+    constexpr unsigned long HEARTBEAT_CHECK_INTERVAL_MS = 500;
+    
     constexpr int MAX_MOTORS = 6;
     constexpr float STEP_ANGLE_DEG = 18.0f;
     constexpr float GEARHEAD_RATIO = 64.0f;
     constexpr int MICROSTEPS = 4;
     constexpr float LEAD_SCREW_LEAD_MM = 0.5f;
     constexpr float BACKLASH_MM = 0.058f;
-
+    
     constexpr float STEPS_PER_REV = (360.0f / STEP_ANGLE_DEG) * MICROSTEPS;
     constexpr float STEPS_PER_MM = (STEPS_PER_REV * GEARHEAD_RATIO) / LEAD_SCREW_LEAD_MM;
     constexpr long BACKLASH_STEPS = static_cast<long>(BACKLASH_MM * STEPS_PER_MM);
-
+    
     constexpr float MAX_ACCELERATION_MM_S2 = 0.5f;
     constexpr float MIN_SPEED_MM_S = 0.001f;
     constexpr float MAX_SPEED_MM_S = 0.2f;
-
+    
     // Position limits in steps
     constexpr float MIN_POSITION_MM = 0.0f;
     constexpr float MAX_POSITION_MM = 50.0f;
     constexpr long MIN_POSITION_STEPS = static_cast<long>(MIN_POSITION_MM * STEPS_PER_MM);
     constexpr long MAX_POSITION_STEPS = static_cast<long>(MAX_POSITION_MM * STEPS_PER_MM);
-
+    
     // Tolerance for "at target" comparison (1 step)
     constexpr long POSITION_TOLERANCE_STEPS = 1;
 }
@@ -81,7 +78,7 @@ struct MotorState {
     bool isActive;
     long targetStepPosition;      // Target position in steps
     long currentStepPosition;     // Current position in steps
-    float speed;                  // Speed in mm/s
+    float speed;                  // Speed in mm/s 
     bool isRunning;
     int8_t direction;
     int8_t lastDirection;
@@ -107,7 +104,7 @@ struct MotorState {
         currentSpeed = 0.0f;
         lastAccelTime = 0;
     }
-
+    
     // Convenience accessors for mm values (for debugging and GUI communication)
     float currentPositionMm() const { return stepsToMm(currentStepPosition); }
     float targetPositionMm() const { return stepsToMm(targetStepPosition); }
@@ -121,14 +118,7 @@ MotorState motors[Config::MAX_MOTORS];
 char serialBuffer[Config::SERIAL_BUFFER_SIZE];
 int serialBufferIndex = 0;
 unsigned long lastHeartbeatReceived = 0;
-bool heartbeatReceived = false;
-
-bool heartbeatIsFresh() {
-    // millis() wraps after ~49 days on Teensy. Unsigned elapsed time keeps
-    // the same timeout behavior across that wrap.
-    uint32_t elapsed = static_cast<uint32_t>(millis() - lastHeartbeatReceived);
-    return heartbeatReceived && elapsed <= Config::HEARTBEAT_TIMEOUT_MS;
-}
+bool heartbeatTimeoutOccurred = false;
 
 // =============================================================================
 // Checksum Utilities
@@ -210,11 +200,11 @@ long backlashEngagedPosition(int8_t direction) {
 
 void startMotor(int idx, float speedMmS, float targetPosMm, float currentPosMm) {
     MotorState& m = motors[idx];
-
+    
     // Convert mm inputs to steps
     long targetSteps = mmToSteps(targetPosMm);
     long currentSteps = mmToSteps(currentPosMm);
-
+    
     m.targetStepPosition = targetSteps;
     m.currentStepPosition = currentSteps;
     m.speed = speedMmS;
@@ -275,7 +265,7 @@ void updateTarget(int idx, float newTargetMm) {
 void stopMotor(int idx) {
     MotorState& m = motors[idx];
     if (m.isRunning) m.lastDirection = m.direction;
-
+    
     m.isRunning = false;
     m.stepsRemaining = 0;
     m.currentSpeed = 0.0f;
@@ -285,31 +275,16 @@ void stopMotor(int idx) {
 }
 
 void stopAllMotors() {
-    bool wasRunning[Config::MAX_MOTORS];
     for (int i = 0; i < Config::MAX_MOTORS; i++) {
-        wasRunning[i] = motors[i].isRunning;
         if (motors[i].isRunning) motors[i].lastDirection = motors[i].direction;
         motors[i].isRunning = false;
         motors[i].stepsRemaining = 0;
         motors[i].currentSpeed = 0.0f;
     }
     disableMotors();
-    // Disable every drive before serial output, which can be slow. Publish
-    // final positions once for the affected drives, not on every stale loop.
-    for (int i = 0; i < Config::MAX_MOTORS; i++) {
-        if (wasRunning[i]) sendPositionUpdate(i + 1);
-    }
-}
-
-void checkHeartbeat() {
-    if (!heartbeatIsFresh() && anyMotorRunning()) {
-        stopAllMotors();
-    }
 }
 
 void updateMotors() {
-    // Enforce the lease before any physical step.
-    checkHeartbeat();
     unsigned long now = micros();
 
     for (int i = 0; i < Config::MAX_MOTORS; i++) {
@@ -399,20 +374,9 @@ void processCommand(const char* cmd) {
     char* token = strtok(data, ",");
     if (!token) return;
 
-    // Stop expired movement before even a late heartbeat renews the lease.
-    checkHeartbeat();
-
-    if (strcmp(token, "GET_FIRMWARE") == 0) {
-        char response[80];
-        snprintf(response, sizeof(response), "FIRMWARE,%s,%s,%s",
-                 Config::FIRMWARE_PRODUCT, Config::FIRMWARE_VARIANT, Config::FIRMWARE_VERSION);
-        sendResponse(response);
-        return;
-    }
-
     if (strcmp(token, "HEARTBEAT") == 0) {
         lastHeartbeatReceived = millis();
-        heartbeatReceived = true;
+        heartbeatTimeoutOccurred = false;
         sendResponse("HEARTBEAT_ACK");
         return;
     }
@@ -438,7 +402,6 @@ void processCommand(const char* cmd) {
         if (!token) return;
         int id = atoi(token);
         if (id < 1 || id > Config::MAX_MOTORS) { sendError(id, "BadID"); return; }
-        if (!heartbeatIsFresh()) { sendError(id, "HeartbeatTimeout"); return; }
         token = strtok(NULL, ",");
         if (!token) return;
         updateTarget(id - 1, atof(token));
@@ -451,7 +414,6 @@ void processCommand(const char* cmd) {
         if (!token) return;
         int id = atoi(token);
         if (id < 1 || id > Config::MAX_MOTORS) { sendError(id, "BadID"); return; }
-        if (!heartbeatIsFresh()) { sendError(id, "HeartbeatTimeout"); return; }
 
         token = strtok(NULL, ",");
         if (!token) return;
@@ -471,7 +433,7 @@ void processCommand(const char* cmd) {
             long targetSteps = mmToSteps(target);
             long distSteps = targetSteps - m.currentStepPosition;
             int8_t newDir = (distSteps > 0) ? 1 : -1;
-
+            
             if (newDir == m.direction || labs(distSteps) < Config::POSITION_TOLERANCE_STEPS) {
                 m.speed = speed;
                 updateTarget(id - 1, target);
@@ -502,6 +464,15 @@ void readSerial() {
     }
 }
 
+void checkHeartbeat() {
+    if (millis() - lastHeartbeatReceived > Config::HEARTBEAT_TIMEOUT_MS) {
+        if (!heartbeatTimeoutOccurred) {
+            stopAllMotors();
+            heartbeatTimeoutOccurred = true;
+        }
+    }
+}
+
 void sendPositionUpdates() {
     static unsigned long lastUpdate = 0;
     if (millis() - lastUpdate >= Config::POSITION_UPDATE_INTERVAL_MS) {
@@ -518,10 +489,10 @@ void sendPositionUpdates() {
 
 void setup() {
     Serial.begin(Config::SERIAL_BAUD);
-
+    
     pinMode(Pins::ENABLE, OUTPUT);
     disableMotors();
-
+    
     for (int i = 0; i < Config::MAX_MOTORS; i++) {
         pinMode(Pins::STEP[i], OUTPUT);
         pinMode(Pins::DIR[i], OUTPUT);
@@ -529,9 +500,8 @@ void setup() {
         digitalWrite(Pins::DIR[i], LOW);
         motors[i].reset();
     }
-
+    
     lastHeartbeatReceived = millis();
-    heartbeatReceived = false;
     sendResponse("READY");
 }
 
@@ -539,4 +509,10 @@ void loop() {
     readSerial();
     updateMotors();
     sendPositionUpdates();
+    
+    static unsigned long lastHBCheck = 0;
+    if (millis() - lastHBCheck >= Config::HEARTBEAT_CHECK_INTERVAL_MS) {
+        checkHeartbeat();
+        lastHBCheck = millis();
+    }
 }
