@@ -1,0 +1,7 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+software/opendrive_state.json
+software/opendrive_export_*.csv
+.DS_Store
