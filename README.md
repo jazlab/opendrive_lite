@@ -4,6 +4,11 @@ A minimal OpenDrive GUI and matching console firmware for controlling up to six 
 
 The [primary OpenDrive codebase](https://github.com/jazlab/opendrive) remains the recommended starting point for the full system. Lite is a separate, self-contained alternative; use its GUI with the firmware in this repository. See the [project website](https://jazlab.github.io/opendrive/) for more information.
 
+## Documentation
+
+- [OpenDrive Lite GUI user manual](https://docs.google.com/document/d/1qMJXmJJQrzLOsQ_BwHMO-qd9XHmxB3R7po1N5IFBGns/edit?usp=sharing): installation, launch, and use of the Lite GUI.
+- [Main OpenDrive documentation](https://docs.google.com/document/d/1CwdIq8lv9Gtcey1GMihnH131U_tzeRZlZ0cmyOJbvFY/edit): hardware, assembly, console setup, and other system details.
+
 ## Install the GUI
 
 Use a desktop Python installation with Tkinter (Python 3.12 is a suitable starting point). `python -m tkinter` should open a small test window. If Tkinter is missing, install the Tk package appropriate for your Python distribution; it is not installed by pip.
@@ -40,7 +45,7 @@ The firmware targets the documented OpenDrive console wiring and motor mechanics
 5. Select a motor's checkbox, enter **Speed** in mm/s and **Target** in absolute mm, then click **Run**. The default limits are 0–50 mm and 0.001–0.2 mm/s. Confirm the intended direction and travel with a short bench movement first.
 6. **Pause** stops selected running motors. **Zero** sets selected motors' relative-position reference; it does not move the drive or change the absolute position. **Export** pauses movement and saves the current table to CSV. Notes and state are also saved automatically.
 
-Read the [OpenDrive documentation](https://docs.google.com/document/d/1CwdIq8lv9Gtcey1GMihnH131U_tzeRZlZ0cmyOJbvFY/edit), especially the GUI Manual, Console Manual, and safety instructions for more details. Do not connect/disconnect drives while powered, let a drive hit a travel stop, or leave a running system unattended. Disconnect console power to stop movement in an emergency. Test the complete system on the bench before experimental use.
+Read the [OpenDrive documentation](https://docs.google.com/document/d/1CwdIq8lv9Gtcey1GMihnH131U_tzeRZlZ0cmyOJbvFY/edit), especially the Console Manual and safety instructions, for other system details. Do not connect/disconnect drives while powered, let a drive hit a travel stop, or leave a running system unattended. Disconnect console power to stop movement in an emergency. Test the complete system on the bench before experimental use.
 
 ## Contact
 
